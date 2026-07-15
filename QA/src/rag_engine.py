@@ -85,6 +85,45 @@ def rewrite_query(llm, query: str) -> str:
         return query
 
 
+MULTI_QUERY_PROMPT = """你是一个AI助手，请根据用户的问题，生成最多3个不同角度的检索查询。
+这些查询应该从不同维度覆盖同一个主题，以提高文档检索的召回率。
+每个查询一行，不要编号，不要多余内容。如果问题很简单，可以少于3个。
+
+用户问题：{query}
+检索查询："""
+
+
+def multi_query_retrieve(llm, vectorstore, query: str) -> str | None:
+    """Multi-Query 检索：生成多个角度的查询词分别检索，去重合并后返回"""
+    try:
+        response = llm.invoke([
+            SystemMessage(content=MULTI_QUERY_PROMPT.format(query=query)),
+        ]).content.strip()
+        queries = [q.strip() for q in response.split("\n") if q.strip()][:3]
+    except Exception:
+        queries = []
+
+    queries.insert(0, query)
+    logger.info("Multi-Query 检索: %s", queries)
+
+    seen = set()
+    all_docs = []
+    for q in queries:
+        docs = vectorstore.similarity_search(q, k=cfg.RETRIEVAL_K)
+        for d in docs:
+            key = d.page_content[:80]
+            if key not in seen:
+                seen.add(key)
+                all_docs.append(d)
+
+    if not all_docs:
+        return None
+    return "\n\n".join(
+        f"[{d.metadata.get('source_pdf', '文档')}·第{d.metadata.get('page', '?')}页] {d.page_content}"
+        for d in all_docs
+    )
+
+
 def is_doc_question(text: str) -> bool:
     t = text.lower()
     return any(kw in t for kw in cfg.DOC_QUESTION_KEYWORDS)
@@ -127,7 +166,7 @@ def make_search_tool(llm, vectorstore):
         """从已加载的PDF文档中检索相关内容。当用户询问文档中的信息、内容、总结、具体主题时，调用此工具"""
         if vectorstore is None:
             return "未检索到相关内容"
-        result = retrieve(llm, vectorstore, query)
+        result = multi_query_retrieve(llm, vectorstore, query)
         return result if result else "未检索到相关内容"
 
     return SearchPDF

@@ -44,6 +44,7 @@ class RAGEngine:
         )
         self.embeddings = AliyunEmbeddings()
         self.llm_with_tools = self.llm
+        self._last_context = None   # 缓存上次检索结果，支持追问
 
     def update_tools(self):
         if self.vectorstore is not None:
@@ -68,6 +69,8 @@ class RAGEngine:
         global_vectorstore = getattr(self, "vectorstore", None)
         if global_vectorstore is not None:
             remove_chroma_db(cfg.CHROMA_DIR)
+
+        self._last_context = None
 
         try:
             self.vectorstore, summaries = build_vectorstore(self.llm, pdf_entries)
@@ -152,6 +155,7 @@ class RAGEngine:
                         context = retrieve(self.llm, self.vectorstore, rewritten)
 
             if context and context != "未检索到相关内容":
+                self._last_context = context
                 final_messages = [
                     SystemMessage(content=QA_SYSTEM_PROMPT.format(context=context)),
                 ] + build_history(history) + [HumanMessage(content=message)]
@@ -161,6 +165,11 @@ class RAGEngine:
             else:
                 logger.info("工具未调用或检索无结果，走普通聊天模式")
                 chat_messages = [SystemMessage(content=CHAT_SYSTEM_PROMPT)] + build_history(history)
+                # 追问：注入上次检索到的上下文，让 LLM 能继续深入对话
+                if self._last_context:
+                    chat_messages.insert(1, SystemMessage(
+                        content=f"以下是与该对话相关的文档资料，如需引用请标注来源：\n{self._last_context}"
+                    ))
                 chat_messages.append(HumanMessage(content=message))
                 for chunk in self.llm.stream(chat_messages):
                     if chunk.content:
