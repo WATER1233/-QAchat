@@ -1,4 +1,5 @@
 pypdf>=5.0
+pymupdf>=1.24
 langchain>=1.3
 langchain-core>=1.4
 langchain-openai>=1.3
@@ -9,3 +10,4 @@ openai>=2.0
 gradio>=6.0
 python-dotenv>=1.0
 requests>=2.31
+dashscope>=1.22

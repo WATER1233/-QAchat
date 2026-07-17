@@ -3,66 +3,134 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.tools import tool
-import shutil
-import time
 import logging
-import os
-
 import src.config as cfg
 from src.embeddings import AliyunEmbeddings
 
 logger = logging.getLogger(__name__)
 
+NEED_SEARCH_PROMPT = """你是一个问答路由。判断用户的问题是否需要查阅特定文档（如 PDF）才能回答。
 
-def build_vectorstore(llm, pdf_files):
-    """pdf_files: list of (file_path, display_name)"""
+返回"yes"或"no"：
+- yes：问题涉及文档内容、文档分析、文档查询、摘要等
+- no：日常闲聊、通用知识、与文档无关的问题
+
+问题：{query}
+结果："""
+
+
+def need_search(llm, query: str) -> bool:
+    """快速判断是否需要检索文档，优先关键词匹配，再 LLM 兜底"""
+    q = query.strip().lower()
+    NO_SEARCH_KEYWORDS = ["你好", "hello", "hi", "嗨", "在干嘛", "在吗", "晚上吃什么",
+                          "今天天气", "你叫什么", "你是谁", "早上好", "下午好", "晚安",
+                          "谢谢", "感谢", "拜拜", "再见"]
+    for kw in NO_SEARCH_KEYWORDS:
+        if kw in q:
+            return False
+    try:
+        resp = llm.invoke([
+            SystemMessage(content=NEED_SEARCH_PROMPT.format(query=query)),
+        ]).content.strip().lower()
+        return resp == "yes"
+    except Exception:
+        return True
+
+NO_RESULT = "未检索到相关内容"
+
+try:
+    import fitz
+    HAS_PYMUPDF = True
+    logger.info("使用 pymupdf 解析 PDF")
+except ImportError:
+    HAS_PYMUPDF = False
+    logger.info("pymupdf 未安装，使用 pypdf 解析 PDF")
+
+
+def extract_pdf_pages(pdf_path: str):
+    """提取 PDF 所有页的文本，优先用 pymupdf（更好的表格/多栏处理），回退到 pypdf。"""
+    pages = []
+    if HAS_PYMUPDF:
+        try:
+            doc = fitz.open(pdf_path)
+            for i, page in enumerate(doc):
+                text = page.get_text("text")
+                if text.strip():
+                    pages.append(Document(page_content=text.strip(), metadata={"page": i + 1}))
+            doc.close()
+            if pages:
+                return pages
+        except Exception as e:
+            logger.warning("pymupdf 解析失败: %s，回退到 pypdf", e)
+
+    reader = PdfReader(pdf_path)
+    pages = []
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text()
+        if text.strip():
+            pages.append(Document(page_content=text.strip(), metadata={"page": i + 1}))
+    return pages
+
+
+def build_vectorstore(llm, pdf_files, existing_vectorstore=None):
+    """pdf_files: list of (file_path, display_name)
+       existing_vectorstore: 已有 Chroma 实例时增量追加，否则新建
+       逐 PDF 处理、逐批入库，避免全量 chunk 驻留内存。"""
     embeddings = AliyunEmbeddings()
-    all_chunks = []
+    vectorstore = existing_vectorstore
     summaries_text = []
 
     for pdf_path, pdf_name in pdf_files:
         logger.info("开始建库，PDF: %s (%s)", pdf_name, pdf_path)
-        reader = PdfReader(pdf_path)
-        docs = []
-        for page in reader.pages:
-            text = page.extract_text()
-            if text.strip():
-                docs.append(Document(page_content=text, metadata={"page": len(docs) + 1}))
+        docs = extract_pdf_pages(pdf_path)
+        if not docs:
+            logger.warning("  %s: 未能提取到文本内容（可能是扫描件）", pdf_name)
+            continue
         logger.info("  %s: 已加载 %d 页", pdf_name, len(docs))
 
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50,
-            separators=["\n\n", "\n", "。", "！", "？", " ", ""],
+            chunk_size=cfg.CHUNK_SIZE,
+            chunk_overlap=cfg.CHUNK_OVERLAP,
+            separators=["\n\n", "\n", "。", "！", "？", "；", " ", ""],
         )
         chunks = text_splitter.split_documents(docs)
         for c in chunks:
             c.metadata["source_pdf"] = pdf_name
-        all_chunks.extend(chunks)
         logger.info("  %s: 已分割为 %d 个段落", pdf_name, len(chunks))
 
+        # 汇总全文本用于摘要（在释放 docs 之前提取）
         full_text = "\n".join(d.page_content for d in docs)
+        # 立即入库，不累计全量 chunk
+        if vectorstore:
+            vectorstore.add_documents(chunks)
+        else:
+            vectorstore = Chroma.from_documents(
+                documents=chunks,
+                embedding=embeddings,
+                persist_directory=cfg.CHROMA_DIR,
+            )
+        logger.info("  %s: 向量库写入完成", pdf_name)
+        # 主动释放引用，允许 GC 回收
+        del chunks, docs
+
+        # 文档摘要（少量文本，不影响内存）
         try:
             summary = llm.invoke([
                 SystemMessage(content="用一句话简要概括以下文档的核心内容，不超过50字。"),
                 HumanMessage(content=full_text[:2000]),
             ]).content.strip()
             summaries_text.append(f"[{pdf_name}] {summary}")
-            all_chunks.append(Document(
+            vectorstore.add_documents([Document(
                 page_content=f"【文档摘要】{pdf_name}：{summary}",
                 metadata={"source_pdf": pdf_name, "is_summary": True, "page": 0},
-            ))
+            )])
             logger.info("  %s: 摘要生成完成", pdf_name)
         except Exception as e:
             logger.warning("  %s: 摘要生成失败: %s", pdf_name, e)
 
-    logger.info("总计 %d 个段落，生成向量中...", len(all_chunks))
-    vectorstore = Chroma.from_documents(
-        documents=all_chunks,
-        embedding=embeddings,
-        persist_directory=cfg.CHROMA_DIR,
-    )
+    if vectorstore is None:
+        return existing_vectorstore, summaries_text
+
     logger.info("向量库已保存")
     return vectorstore, summaries_text
 
@@ -92,25 +160,104 @@ MULTI_QUERY_PROMPT = """你是一个AI助手，请根据用户的问题，生成
 用户问题：{query}
 检索查询："""
 
+HYDE_PROMPT = """你是一位文档撰写者。根据以下问题，写一段**假设性的文档段落**作为回答。
+要求：语言客观、信息密集、结构清晰，像真实的技术文档/报告节选。
+只输出段落内容，不要解释。
 
-def multi_query_retrieve(llm, vectorstore, query: str) -> str | None:
-    """Multi-Query 检索：生成多个角度的查询词分别检索，去重合并后返回"""
+问题：{query}
+假设文档段落："""
+
+
+def hyde_generate(llm, query: str) -> str | None:
+    """HyDE: 生成假设文档段落用于检索"""
     try:
         response = llm.invoke([
-            SystemMessage(content=MULTI_QUERY_PROMPT.format(query=query)),
+            SystemMessage(content=HYDE_PROMPT.format(query=query)),
         ]).content.strip()
-        queries = [q.strip() for q in response.split("\n") if q.strip()][:3]
-    except Exception:
-        queries = []
+        if response:
+            logger.info("HyDE 生成完成: %s...", response[:60])
+            return response
+    except Exception as e:
+        logger.warning("HyDE 生成失败: %s", e)
+    return None
 
-    queries.insert(0, query)
-    logger.info("Multi-Query 检索: %s", queries)
+
+def rerank_docs(query: str, docs: list[Document], top_n: int = None) -> list[Document]:
+    """调用阿里云百炼 Reranker API 对文档精排，返回排序后的 top_n 条"""
+    if not docs:
+        return docs
+    top_n = top_n or cfg.RERANK_TOP_N
+    documents = [
+        f"[{d.metadata.get('source_pdf', '文档')}·第{d.metadata.get('page', '?')}页] {d.page_content}"
+        for d in docs
+    ]
+    try:
+        import requests
+        resp = requests.post(
+            "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+            headers={
+                "Authorization": f"Bearer {cfg.API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": cfg.RERANK_MODEL,
+                "input": {"query": query, "documents": documents},
+                "parameters": {"top_n": top_n},
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            logger.warning("Reranker 返回异常: %s %s", resp.status_code, resp.text[:200])
+            return docs[:top_n]
+        body = resp.json()
+        results = body.get("output", {}).get("results", [])
+        ranked = []
+        for r in results:
+            idx = r.get("index")
+            if idx is not None and idx < len(docs):
+                ranked.append(docs[idx])
+        logger.info("Reranker 精排完成: %d -> %d 条", len(docs), len(ranked))
+        return ranked
+    except Exception as e:
+        logger.warning("Reranker 调用失败，使用原始排序: %s", e)
+        return docs[:top_n]
+
+
+def multi_query_retrieve(llm, vectorstore, query: str) -> str | None:
+    """Multi-Query 检索 + HyDE：并行执行多角度关键词 + 假设文档段落，去重合并后返回"""
+    multi_queries = []
+    hyde_text = None
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+    with _TPE(max_workers=2) as _pool:
+        _mq = _pool.submit(
+            lambda: llm.invoke([
+                SystemMessage(content=MULTI_QUERY_PROMPT.format(query=query)),
+            ]).content.strip()
+        )
+        _hy = _pool.submit(hyde_generate, llm, query)
+        try:
+            response = _mq.result()
+            multi_queries = [q.strip() for q in response.split("\n") if q.strip()][:3]
+        except Exception:
+            pass
+        try:
+            hyde_text = _hy.result()
+        except Exception:
+            pass
+
+    queries = [query] + multi_queries
+    if hyde_text:
+        queries.append(hyde_text)
+    logger.info("Multi-Query + HyDE 检索: %d 个查询", len(queries))
 
     seen = set()
     all_docs = []
     for q in queries:
-        docs = vectorstore.similarity_search(q, k=cfg.RETRIEVAL_K)
-        for d in docs:
+        docs_with_scores = vectorstore.similarity_search_with_relevance_scores(q, k=cfg.RETRIEVAL_K)
+        for d, score in docs_with_scores:
+            if score < cfg.SIMILARITY_THRESHOLD:
+                continue
             key = d.page_content[:80]
             if key not in seen:
                 seen.add(key)
@@ -118,55 +265,31 @@ def multi_query_retrieve(llm, vectorstore, query: str) -> str | None:
 
     if not all_docs:
         return None
+
+    # Reranker 精排，取 top_n 条
+    all_docs = rerank_docs(query, all_docs)
+
     return "\n\n".join(
         f"[{d.metadata.get('source_pdf', '文档')}·第{d.metadata.get('page', '?')}页] {d.page_content}"
         for d in all_docs
     )
 
 
-def is_doc_question(text: str) -> bool:
-    t = text.lower()
-    return any(kw in t for kw in cfg.DOC_QUESTION_KEYWORDS)
-
-
 def retrieve(llm, vectorstore, query: str):
     rewritten = rewrite_query(llm, query)
-    docs = vectorstore.similarity_search(rewritten, k=cfg.RETRIEVAL_K)
+    docs_with_scores = vectorstore.similarity_search_with_relevance_scores(rewritten, k=cfg.RETRIEVAL_K)
+    docs = [d for d, s in docs_with_scores if s >= cfg.SIMILARITY_THRESHOLD]
     if not docs:
-        docs = vectorstore.similarity_search(query, k=cfg.RETRIEVAL_K)
+        docs_with_scores = vectorstore.similarity_search_with_relevance_scores(query, k=cfg.RETRIEVAL_K)
+        docs = [d for d, s in docs_with_scores if s >= cfg.SIMILARITY_THRESHOLD]
     if not docs:
         return None
+
+    docs = rerank_docs(query, docs)
+
     return "\n\n".join(
         f"[{d.metadata.get('source_pdf', '文档')}·第{d.metadata.get('page', '?')}页] {d.page_content}"
         for d in docs
     )
 
 
-def remove_chroma_db(path: str):
-    if not os.path.exists(path):
-        return
-    for attempt in range(5):
-        try:
-            shutil.rmtree(path)
-            logger.info("旧向量库已删除")
-            return
-        except PermissionError:
-            if attempt < 4:
-                logger.warning("文件被占用，等待重试 (%d/5)...", attempt + 1)
-                time.sleep(1)
-            else:
-                logger.error("删除向量库失败，文件仍被占用")
-
-
-def make_search_tool(llm, vectorstore):
-    """Create a SearchPDF tool bound to the current vectorstore."""
-
-    @tool
-    def SearchPDF(query: str) -> str:
-        """从已加载的PDF文档中检索相关内容。当用户询问文档中的信息、内容、总结、具体主题时，调用此工具"""
-        if vectorstore is None:
-            return "未检索到相关内容"
-        result = multi_query_retrieve(llm, vectorstore, query)
-        return result if result else "未检索到相关内容"
-
-    return SearchPDF
