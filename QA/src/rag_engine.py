@@ -9,25 +9,62 @@ from src.embeddings import AliyunEmbeddings
 
 logger = logging.getLogger(__name__)
 
-NEED_SEARCH_PROMPT = """你是一个问答路由。判断用户的问题是否需要查阅特定文档（如 PDF）才能回答。
+NEED_SEARCH_PROMPT = """你是一个问答路由。严格按以下规则判断用户问题是否需要查阅文档。
 
-返回"yes"或"no"：
-- yes：问题涉及文档内容、文档分析、文档查询、摘要等
-- no：日常闲聊、通用知识、与文档无关的问题
+规则：
+- "yes" → 问题是关于文档内容、文档分析、文档查询、摘要等具体信息
+- "no"  → 日常闲聊、问候、感谢、告别、通用常识、询问 AI 本身、无关话题
+
+示例：
+  问：报告中的营收数据是多少 → yes
+  问：文档第三章讲了什么 → yes
+  问：帮我总结一下这份 PDF → yes
+  问：你好                  → no
+  问：今天天气怎么样         → no
+  问：谢谢                  → no
+  问：你是谁                → no
+  问：1+1等于几             → no
+  问：你能做什么             → no
+  问：没事了                 → no
+
+只输出 yes 或 no，不要其它内容。
 
 问题：{query}
 结果："""
 
 
-def need_search(llm, query: str) -> bool:
-    """快速判断是否需要检索文档，优先关键词匹配，再 LLM 兜底"""
-    q = query.strip().lower()
-    NO_SEARCH_KEYWORDS = ["你好", "hello", "hi", "嗨", "在干嘛", "在吗", "晚上吃什么",
-                          "今天天气", "你叫什么", "你是谁", "早上好", "下午好", "晚安",
-                          "谢谢", "感谢", "拜拜", "再见"]
-    for kw in NO_SEARCH_KEYWORDS:
+def _no_search_keyword_match(q: str) -> bool:
+    """关键词预匹配，命中直接返回 False（不查文档），覆盖大部分闲聊场景。"""
+    keywords = [
+        # 问候
+        "你好", "hello", "hi", "嗨", "嗨喽", "哈喽", "hey",
+        "早上好", "下午好", "晚上好", "晚安",
+        # 询问 AI 身份/能力
+        "你是谁", "你叫什么", "你叫什么名字", "你是什么",
+        "你能做什么", "你会什么", "你有什么功能",
+        # 礼貌用语
+        "谢谢", "感谢", "多谢", "辛苦了", "谢谢你",
+        "拜拜", "再见", "88", "bye",
+        # 日常闲聊
+        "在干嘛", "在吗", "在不在", "干嘛呢",
+        "晚上吃什么", "中午吃什么", "今天吃什么",
+        "今天天气", "明天天气",
+        "没事", "没事了", "没什么", "算了", "好吧",
+        # 通用知识（不需要查文档）
+        "1+1", "2+2", "等于几", "等于多少",
+        "现在几点", "几点了", "今天几号",
+    ]
+    for kw in keywords:
         if kw in q:
-            return False
+            return True
+    return False
+
+
+def need_search(llm, query: str) -> bool:
+    """判断是否需要检索文档：关键词预匹配 → LLM 路由兜底。"""
+    q = query.strip().lower()
+    if _no_search_keyword_match(q):
+        return False
     try:
         resp = llm.invoke([
             SystemMessage(content=NEED_SEARCH_PROMPT.format(query=query)),

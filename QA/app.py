@@ -342,10 +342,12 @@ with gr.Blocks(title="PDF 智能问答系统", css=CSS, theme=gr.themes.Soft(
             logger.info("助手回复完成, 长度: %d", len(entry["content"]))
         except Exception as e:
             logger.error("respond_wrapper 异常: %s", e, exc_info=True)
-            yield "", chat_history + [
-                {"role": "user", "content": message},
-                {"role": "assistant", "content": f"系统错误: {e}"},
-            ]
+            # 回退正常流程已追加的空条目，避免重复
+            if len(chat_history) >= 2 and chat_history[-1].get("content", "") == "":
+                chat_history = chat_history[:-2]
+            chat_history.append({"role": "user", "content": message})
+            chat_history.append({"role": "assistant", "content": f"系统错误: {e}"})
+            yield "", chat_history
 
     msg.submit(show_thinking, None, thinking).then(
         respond_wrapper, [msg, chatbot], [msg, chatbot]
