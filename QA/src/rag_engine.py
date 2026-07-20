@@ -84,9 +84,28 @@ except ImportError:
     logger.info("pymupdf 未安装，使用 pypdf 解析 PDF")
 
 
+def _table_to_markdown(data: list[list[str]]) -> str:
+    """将 pymupdf 表格数据（二维列表）转为 Markdown 表格格式。"""
+    if not data or not data[0]:
+        return ""
+    lines = []
+    header = data[0]
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("| " + " | ".join("---" for _ in header) + " |")
+    for row in data[1:]:
+        # 补齐短行，截断长行，保证列数一致
+        row = row[:len(header)]
+        while len(row) < len(header):
+            row.append("")
+        lines.append("| " + " | ".join(c.replace("\n", " ") for c in row) + " |")
+    return "\n".join(lines)
+
+
 def extract_pdf_pages(pdf_path: str):
-    """提取 PDF 所有页的文本，优先用 pymupdf（更好的表格/多栏处理），回退到 pypdf。"""
+    """提取 PDF 所有页的文本和表格，优先用 pymupdf，回退到 pypdf。
+    返回 (pages_docs, table_docs) 两个列表。"""
     pages = []
+    tables = []
     if HAS_PYMUPDF:
         try:
             doc = fitz.open(pdf_path)
@@ -94,19 +113,28 @@ def extract_pdf_pages(pdf_path: str):
                 text = page.get_text("text")
                 if text.strip():
                     pages.append(Document(page_content=text.strip(), metadata={"page": i + 1}))
+
+                # 提取表格
+                found = page.find_tables()
+                for ti, tbl in enumerate(found.tables):
+                    data = tbl.extract()
+                    md = _table_to_markdown(data)
+                    if md:
+                        tables.append(Document(
+                            page_content=f"[表格 {ti + 1}]\n{md}",
+                            metadata={"page": i + 1, "is_table": True},
+                        ))
             doc.close()
-            if pages:
-                return pages
+            return pages, tables
         except Exception as e:
             logger.warning("pymupdf 解析失败: %s，回退到 pypdf", e)
 
     reader = PdfReader(pdf_path)
-    pages = []
     for i, page in enumerate(reader.pages):
         text = page.extract_text()
         if text.strip():
             pages.append(Document(page_content=text.strip(), metadata={"page": i + 1}))
-    return pages
+    return pages, tables
 
 
 def build_vectorstore(llm, pdf_files, existing_vectorstore=None):
@@ -119,36 +147,44 @@ def build_vectorstore(llm, pdf_files, existing_vectorstore=None):
 
     for pdf_path, pdf_name in pdf_files:
         logger.info("开始建库，PDF: %s (%s)", pdf_name, pdf_path)
-        docs = extract_pdf_pages(pdf_path)
-        if not docs:
-            logger.warning("  %s: 未能提取到文本内容（可能是扫描件）", pdf_name)
+        pages, table_docs = extract_pdf_pages(pdf_path)
+        if not pages and not table_docs:
+            logger.warning("  %s: 未能提取到任何内容（可能是扫描件）", pdf_name)
             continue
-        logger.info("  %s: 已加载 %d 页", pdf_name, len(docs))
+        logger.info("  %s: 已加载 %d 页文本、%d 个表格",
+                     pdf_name, len(pages), len(table_docs))
 
+        # 文本分块
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=cfg.CHUNK_SIZE,
             chunk_overlap=cfg.CHUNK_OVERLAP,
             separators=["\n\n", "\n", "。", "！", "？", "；", " ", ""],
         )
-        chunks = text_splitter.split_documents(docs)
+        chunks = text_splitter.split_documents(pages)
         for c in chunks:
             c.metadata["source_pdf"] = pdf_name
-        logger.info("  %s: 已分割为 %d 个段落", pdf_name, len(chunks))
+        logger.info("  %s: 文本已分割为 %d 个段落", pdf_name, len(chunks))
 
-        # 汇总全文本用于摘要（在释放 docs 之前提取）
-        full_text = "\n".join(d.page_content for d in docs)
-        # 立即入库，不累计全量 chunk
+        # 表格文档不拆分，直接加入
+        for t in table_docs:
+            t.metadata["source_pdf"] = pdf_name
+        all_docs = chunks + table_docs
+        logger.info("  %s: 共 %d 个文档（含 %d 个表格）",
+                     pdf_name, len(all_docs), len(table_docs))
+
+        # 汇总全文本用于摘要
+        full_text = "\n".join(d.page_content for d in pages)
+        # 立即入库
         if vectorstore:
-            vectorstore.add_documents(chunks)
+            vectorstore.add_documents(all_docs)
         else:
             vectorstore = Chroma.from_documents(
-                documents=chunks,
+                documents=all_docs,
                 embedding=embeddings,
                 persist_directory=cfg.CHROMA_DIR,
             )
         logger.info("  %s: 向量库写入完成", pdf_name)
-        # 主动释放引用，允许 GC 回收
-        del chunks, docs
+        del pages, chunks, table_docs, all_docs
 
         # 文档摘要（少量文本，不影响内存）
         try:
@@ -307,9 +343,17 @@ def multi_query_retrieve(llm, vectorstore, query: str) -> str | None:
     all_docs = rerank_docs(query, all_docs)
 
     return "\n\n".join(
-        f"[{d.metadata.get('source_pdf', '文档')}·第{d.metadata.get('page', '?')}页] {d.page_content}"
+        _format_citation(d)
         for d in all_docs
     )
+
+
+def _format_citation(d: Document) -> str:
+    """统一格式化文档引用，表格来源标注 📊 图标"""
+    source = d.metadata.get("source_pdf", "文档")
+    page = d.metadata.get("page", "?")
+    prefix = "📊 " if d.metadata.get("is_table") else ""
+    return f"{prefix}[{source}·第{page}页] {d.page_content}"
 
 
 def retrieve(llm, vectorstore, query: str):
@@ -325,7 +369,7 @@ def retrieve(llm, vectorstore, query: str):
     docs = rerank_docs(query, docs)
 
     return "\n\n".join(
-        f"[{d.metadata.get('source_pdf', '文档')}·第{d.metadata.get('page', '?')}页] {d.page_content}"
+        _format_citation(d)
         for d in docs
     )
 

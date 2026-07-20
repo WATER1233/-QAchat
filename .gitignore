@@ -14,6 +14,13 @@ __pycache__/
 .venv/
 venv/
 
+# Node
+node_modules/
+.npm-cache/
+
+# Project build output
+frontend/dist/
+
 # Project data (regeneratable)
 chroma_db/
 temp_uploads/
